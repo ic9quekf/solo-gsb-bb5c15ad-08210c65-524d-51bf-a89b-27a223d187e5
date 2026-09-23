@@ -325,3 +325,28 @@ class CursorErrorDetail(BaseModel):
 class ErrorOut(BaseModel):
     error: str
     detail: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# 按匿名 StudyInstanceUID 下载检查子集（GET /jobs/{id}/studies/{uid}/download）
+# --------------------------------------------------------------------------- #
+class StudySubsetProblemItem(BaseModel):
+    sop_instance_uid: str = Field(description="出问题的匿名（已重写）SOPInstanceUID")
+    reason: str = Field(
+        description="not_in_output（引用目标不在本任务成功输出中） | "
+        "ambiguous_output（同一匿名 SOP UID 对应多个输出文件）"
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的扁平输出文件名"
+    )
+    message: str
+
+
+class StudySubsetErrorDetail(BaseModel):
+    code: str = Field(
+        description="STUDY_NOT_FOUND（404） | REFERENCE_CLOSURE_INCOMPLETE（409） | "
+        "JOB_NOT_READY（409） | ANONYMIZED_OUTPUT_UNREADABLE（500）"
+    )
+    message: str
+    study_instance_uid: Optional[str] = None
+    problems: list[StudySubsetProblemItem] = []

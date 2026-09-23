@@ -72,7 +72,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射；支持差异明细分页（`level`/`limit`/`cursor`） |
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
-| `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP |
+| `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
+| `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -123,6 +124,101 @@ curl http://localhost:8000/jobs/$JOB_ID/files
 
 # 3) 下载匿名化 ZIP（文件名为新 SOPInstanceUID，扁平结构）
 curl -OJ http://localhost:8000/jobs/$JOB_ID/download
+```
+
+### 按匿名 StudyInstanceUID 下载检查子集
+
+除全量下载外，还可以只下载某一个匿名检查，并由服务端**沿 SOP 引用自动补全**
+该检查依赖的实例。子集下载**直接复用已完成任务 output 目录中的匿名 DICOM 文件，
+不会重新解压或处理原始 ZIP**。
+
+`study_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}`
+响应里的 `studies[].new_study_instance_uid`（或某文件的 `study_instance_uid`）。
+
+闭包补全规则：
+
+1. 以该匿名检查的**全部成功输出实例**作为初选集合；
+2. 递归读取集合内匿名 DICOM **任意序列层级**的 `ReferencedSOPInstanceUID`
+   （`ReferencedSOPSequence`、RT 的 `ContourImageSequence`、
+   `ReferencedFrameOfReferenceSequence` 等），把**同任务内**被引用的实例补入集合，
+   引用目标可以属于**其他匿名检查**（跨检查引用同样补入），重复扫描直至闭包稳定；
+3. 只要存在引用目标**不在成功输出中**，或**一个匿名 SOP UID 对应多个输出文件**
+   （输入 ZIP 内重复实例），接口返回 `409`，在 `detail.problems[]` 中给出
+   **匿名 SOP UID 与原因**，**不输出残缺 ZIP**；
+4. 匿名检查在任务成功输出中不存在时返回 `404`（任务不存在同为 `404`）。
+
+成功时返回扁平 ZIP（文件名即匿名 `SOPInstanceUID`，与全量包内文件**逐字节相同**），
+并通过响应头给出初选与补入文件数：
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-Study-Initial-File-Count` | 初选文件数（该匿名检查的全部实例） |
+| `X-Study-Added-File-Count` | 递归补入的文件数（含跨检查引用） |
+| `X-Study-Subset-File-Count` | ZIP 总文件数（初选 + 补入） |
+
+```bash
+# 4) 取某个匿名 StudyInstanceUID（new_study_instance_uid），下载检查子集
+STUDY_UID=$(python3 -c "import json;print(json.load(open('job.json'))['studies'][0]['new_study_instance_uid'])")
+
+curl -OJ -D subset.headers \
+  "http://localhost:8000/jobs/$JOB_ID/studies/$STUDY_UID/download"
+grep -i '^x-study-' subset.headers
+# x-study-initial-file-count: 3
+# x-study-added-file-count: 1
+# x-study-subset-file-count: 4
+```
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/studies/{study_uid}/download"
+)
+if resp.status_code == 404:
+    print("任务或匿名检查不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("引用闭包无法闭合：", detail["code"])
+    for p in detail["problems"]:
+        # reason: not_in_output（引用目标不在成功输出中）
+        #       | ambiguous_output（同一 SOP UID 对应多个输出文件）
+        print(p["sop_instance_uid"], p["reason"], p.get("output_files"))
+else:
+    resp.raise_for_status()
+    print("初选：", resp.headers["X-Study-Initial-File-Count"],
+          "补入：", resp.headers["X-Study-Added-File-Count"])
+    open("study-subset.zip", "wb").write(resp.content)
+```
+
+> 注意：匿名化时的悬空引用（`DANGLING_REFERENCE` 警告）会使引用闭包无法在本任务
+> 输出内闭合，因此含此类引用的检查子集下载会返回 `409`；请改全量下载
+> `GET /jobs/{id}/download`（行为不变），或在上传前补齐被引用实例。
+
+错误响应（HTTP 4xx，`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
+| `404` | `STUDY_NOT_FOUND` | 该匿名 StudyInstanceUID 不在任务的成功输出中 |
+| `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
+| `409` | `REFERENCE_CLOSURE_INCOMPLETE` | 引用闭包无法在成功输出内闭合；`detail.problems[]` 逐项给出匿名 `sop_instance_uid`、`reason`（`not_in_output` / `ambiguous_output`）与 `output_files`（歧义时的冲突文件名） |
+
+`409` 响应示例：
+
+```jsonc
+{
+  "detail": {
+    "code": "REFERENCE_CLOSURE_INCOMPLETE",
+    "message": "引用闭包无法在本任务的成功输出内闭合，已拒绝输出子集 ZIP",
+    "study_instance_uid": "2.25.8912…",
+    "problems": [
+      {"sop_instance_uid": "2.25.1613…",
+       "reason": "not_in_output",          // 或 ambiguous_output
+       "output_files": [],                  // ambiguous_output 时为冲突文件名列表
+       "message": "引用目标不在本任务的成功输出中"}
+    ]
+  }
+}
 ```
 
 Python 示例：
@@ -501,16 +597,17 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/download、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、全量/检查子集下载、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
 │   ├── pagination.py    # 差异明细不透明分页游标：HMAC 签名、绑定任务集合/level、TTL
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对与分页模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页与子集下载错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标（99 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集（110 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

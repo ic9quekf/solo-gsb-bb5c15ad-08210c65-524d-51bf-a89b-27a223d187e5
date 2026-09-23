@@ -8,11 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency, pagination
+from . import consistency, pagination, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -26,6 +26,7 @@ from .schemas import (
     PatientOut,
     SeriesOut,
     StudyOut,
+    StudySubsetErrorDetail,
 )
 
 
@@ -387,6 +388,75 @@ def download_job(job_id: str):
     )
 
 
+@app.get(
+    "/jobs/{job_id}/studies/{study_instance_uid}/download",
+    tags=["jobs"],
+    summary="按匿名 StudyInstanceUID 下载检查子集（自动补全跨检查 SOP 引用闭包）",
+    responses={
+        404: {"model": StudySubsetErrorDetail,
+              "description": "任务不存在，或该匿名检查不在任务的成功输出中"},
+        409: {"model": StudySubsetErrorDetail,
+              "description": "任务未完成，或引用闭包无法在成功输出内闭合"
+                             "（引用缺失 / 一个 SOP UID 对应多个输出文件）"},
+    },
+)
+def download_study_subset(
+    job_id: str,
+    study_instance_uid: str,
+    background_tasks: BackgroundTasks,
+):
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "study_instance_uid": study_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "study_instance_uid": study_instance_uid,
+            },
+        )
+
+    try:
+        zip_path, initial_count, added_count = study_subset.write_study_subset_zip(
+            job, study_instance_uid
+        )
+    except study_subset.StudySubsetError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    background_tasks.add_task(_safe_unlink, zip_path)
+    # Content-Disposition filename 只允许 token 字符；匿名 UID 为 2.25.<digits>，
+    # 点号安全，额外保留 UID 后 24 位避免过长
+    safe_uid = "".join(ch for ch in study_instance_uid if ch.isalnum() or ch in ".-")
+    name = f"study-{safe_uid[-24:]}.zip"
+    headers = {
+        "X-Study-Initial-File-Count": str(initial_count),
+        "X-Study-Added-File-Count": str(added_count),
+        "X-Study-Subset-File-Count": str(initial_count + added_count),
+    }
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=name,
+        headers=headers,
+    )
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @app.get("/", include_in_schema=False)
 def root() -> dict:
     return {
@@ -399,6 +469,7 @@ def root() -> dict:
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
+            "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
             "GET /health",
         ],
     }
