@@ -8,11 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency, pagination
+from . import consistency, pagination, study_export
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -25,6 +25,7 @@ from .schemas import (
     JobOut,
     PatientOut,
     SeriesOut,
+    StudyExportErrorDetail,
     StudyOut,
 )
 
@@ -387,6 +388,107 @@ def download_job(job_id: str):
     )
 
 
+@app.get(
+    "/jobs/{job_id}/studies/{study_instance_uid}/download",
+    tags=["jobs"],
+    summary=(
+        "按匿名 StudyInstanceUID 下载检查子集（递归补入同任务内被引用实例，"
+        "含跨检查引用）"
+    ),
+    responses={
+        404: {"model": StudyExportErrorDetail,
+              "description": "任务不存在（纯文本 detail），或匿名检查在该任务中不存在"},
+        409: {"model": StudyExportErrorDetail,
+              "description": "任务未完成，或引用闭包不完整（引用目标缺失/一个 SOP UID 对应多个输出）"},
+    },
+)
+def download_job_study(
+    background_tasks: BackgroundTasks,
+    job_id: str,
+    study_instance_uid: str,
+):
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_COMPLETED",
+                "message": f"任务处理失败：{job.error}",
+                "study_instance_uid": study_instance_uid,
+            },
+        )
+
+    subset = study_export.build_study_subset(job, study_instance_uid)
+    if not subset.study_exists:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "STUDY_NOT_FOUND",
+                "message": (
+                    f"匿名 StudyInstanceUID {study_instance_uid} 在该任务中不存在"
+                    "（或没有任何成功输出实例）"
+                ),
+                "study_instance_uid": study_instance_uid,
+            },
+        )
+    if subset.conflicts:
+        # 引用闭包不完整：不产出残缺 ZIP，返回全部匿名冲突 UID 与原因
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "INCOMPLETE_REFERENCE_CLOSURE",
+                "message": (
+                    "检查子集的引用闭包不完整（存在无法解析的 SOP 引用），"
+                    "为避免输出残缺 ZIP 已拒绝下载"
+                ),
+                "study_instance_uid": study_instance_uid,
+                "primary_file_count": len(subset.primary_outputs),
+                "added_file_count": len(subset.added_outputs),
+                "conflicts": [c.to_dict() for c in subset.conflicts],
+            },
+        )
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"study-{job.id[:8]}-", suffix=".zip",
+        dir=os.path.dirname(job.zip_path),
+    )
+    os.close(fd)
+    try:
+        study_export.build_subset_zip(
+            job.result.output_dir, subset.selected_outputs, tmp_path
+        )
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+    background_tasks.add_task(_safe_unlink, tmp_path)
+
+    headers = {
+        "X-Study-Primary-Count": str(len(subset.primary_outputs)),
+        "X-Study-Added-Count": str(len(subset.added_outputs)),
+        "X-Study-Total-Count": str(len(subset.selected_outputs)),
+        "X-Job-File-Count": str(len(job.result.files)),
+    }
+    return FileResponse(
+        tmp_path,
+        media_type="application/zip",
+        filename=f"anonymized-study-{study_instance_uid}.zip",
+        headers=headers,
+    )
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @app.get("/", include_in_schema=False)
 def root() -> dict:
     return {
@@ -399,6 +501,7 @@ def root() -> dict:
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
+            "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
             "GET /health",
         ],
     }

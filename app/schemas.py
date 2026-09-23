@@ -322,6 +322,45 @@ class CursorErrorDetail(BaseModel):
     message: str
 
 
+class StudyExportConflictItem(BaseModel):
+    code: str = Field(
+        description=(
+            "MISSING_REFERENCED_INSTANCE（被引用 SOP 不在本任务成功输出中） | "
+            "AMBIGUOUS_REFERENCED_INSTANCE（同一匿名 SOP UID 对应多个输出文件）"
+        )
+    )
+    referenced_sop_instance_uid: str = Field(description="冲突涉及的匿名 SOP UID")
+    reason: str
+    output_names: list[str] = Field(
+        default=[],
+        description="AMBIGUOUS 时对应的多个扁平输出文件名；MISSING 时为空",
+    )
+    referenced_by: list[str] = Field(
+        default=[], description="引用了该目标的扁平输出文件名"
+    )
+
+
+class StudyExportErrorDetail(BaseModel):
+    code: str = Field(
+        description=(
+            "STUDY_NOT_FOUND（匿名 StudyInstanceUID 在该任务中不存在） | "
+            "INCOMPLETE_REFERENCE_CLOSURE（引用闭包不完整，不输出残缺 ZIP） | "
+            "JOB_NOT_COMPLETED（任务未成功完成）"
+        )
+    )
+    message: str
+    study_instance_uid: Optional[str] = None
+    primary_file_count: int = Field(
+        default=0, description="初选文件数（该检查的全部成功实例）"
+    )
+    added_file_count: int = Field(
+        default=0, description="引用闭包已成功补入的文件数（含跨检查引用）"
+    )
+    conflicts: list[StudyExportConflictItem] = Field(
+        default=[], description="全部引用闭包冲突（匿名 UID + 原因）"
+    )
+
+
 class ErrorOut(BaseModel):
     error: str
     detail: Optional[str] = None

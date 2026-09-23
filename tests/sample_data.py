@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import zipfile
 
+import pydicom
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import (
     CTImageStorage,
@@ -70,9 +71,19 @@ def _ct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
     return _write_bytes(ds)
 
 
-def _rtstruct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
-                   patient_name: str, frame_uid: str, ref_sop: str,
-                   dangling_sop: str) -> bytes:
+def _rtstruct_refs(
+    sop_uid: str,
+    series_uid: str,
+    study_uid: str,
+    patient_id: str,
+    patient_name: str,
+    *,
+    frame_uid: str | None = None,
+    contour_series_uid: str | None = None,
+    contour_refs: tuple[str, ...] = (),
+    direct_refs: tuple[str, ...] = (),
+) -> bytes:
+    """构造 RTSTRUCT：深层 ContourImageSequence 引用 + 顶层 ReferencedSOPSequence。"""
     file_meta = FileMetaDataset()
     file_meta.MediaStorageSOPClassUID = RTStructureSetStorage
     file_meta.MediaStorageSOPInstanceUID = sop_uid
@@ -91,24 +102,40 @@ def _rtstruct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: st
     ds.StructureSetLabel = "RTSTRUCT"
     ds.Modality = "RTSTRUCT"
 
-    # RT ReferencedFrameOfReferenceSequence（深层嵌套引用）
-    rfors = Dataset()
-    rfors.FrameOfReferenceUID = frame_uid
-    rtrs = Dataset()
-    rtrs.SeriesInstanceUID = series_uid
-    cis = Dataset()
-    cis.ReferencedSOPClassUID = CTImageStorage
-    cis.ReferencedSOPInstanceUID = ref_sop
-    rtrs.ContourImageSequence = [cis]
-    rfors.RTReferencedStudySequence = [rtrs]
-    ds.ReferencedFrameOfReferenceSequence = [rfors]
+    # RT ReferencedFrameOfReferenceSequence（深层嵌套引用，任意层级）
+    if contour_refs:
+        rfors = Dataset()
+        if frame_uid is not None:
+            rfors.FrameOfReferenceUID = frame_uid
+        rtrs = Dataset()
+        rtrs.SeriesInstanceUID = contour_series_uid or series_uid
+        rtrs.ContourImageSequence = []
+        for ref in contour_refs:
+            cis = Dataset()
+            cis.ReferencedSOPClassUID = CTImageStorage
+            cis.ReferencedSOPInstanceUID = ref
+            rtrs.ContourImageSequence.append(cis)
+        rfors.RTReferencedStudySequence = [rtrs]
+        ds.ReferencedFrameOfReferenceSequence = [rfors]
 
-    # 引用一个压缩包内不存在的 SOP（dangling reference）
-    dangling_item = Dataset()
-    dangling_item.ReferencedSOPClassUID = CTImageStorage
-    dangling_item.ReferencedSOPInstanceUID = dangling_sop
-    ds.ReferencedSOPSequence = [dangling_item]
+    if direct_refs:
+        ds.ReferencedSOPSequence = []
+        for ref in direct_refs:
+            item = Dataset()
+            item.ReferencedSOPClassUID = CTImageStorage
+            item.ReferencedSOPInstanceUID = ref
+            ds.ReferencedSOPSequence.append(item)
     return _write_bytes(ds)
+
+
+def _rtstruct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
+                   patient_name: str, frame_uid: str, ref_sop: str,
+                   dangling_sop: str) -> bytes:
+    return _rtstruct_refs(
+        sop_uid, series_uid, study_uid, patient_id, patient_name,
+        frame_uid=frame_uid, contour_series_uid=series_uid,
+        contour_refs=(ref_sop,), direct_refs=(dangling_sop,),
+    )
 
 
 def build_sample_zip(path: str, seed: int = 1) -> dict:
@@ -143,4 +170,101 @@ def build_sample_zip(path: str, seed: int = 1) -> dict:
         "sops": sops,
         "rt_sop": rt_sop,
         "dangling": dangling,
+    }
+
+
+def _ct_with_refs(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
+                  patient_name: str, frame_uid: str,
+                  direct_refs: tuple[str, ...] = ()) -> bytes:
+    """与 _ct_like 相同的 CT，但顶层带 ReferencedSOPSequence 引用。"""
+    blob = _ct_like(sop_uid, series_uid, study_uid, patient_id, patient_name, frame_uid)
+    # 重新读出并追加引用后写回，避免重复维护 CT 字段
+    ds = pydicom.dcmread(io.BytesIO(blob))
+    if direct_refs:
+        ds.ReferencedSOPSequence = []
+        for ref in direct_refs:
+            item = Dataset()
+            item.ReferencedSOPClassUID = CTImageStorage
+            item.ReferencedSOPInstanceUID = ref
+            ds.ReferencedSOPSequence.append(item)
+    return _write_bytes(ds)
+
+
+def build_multistudy_zip(path: str, *, seed: int = 100) -> dict:
+    """三个检查（其中两个跨患者）+ 多跳跨检查引用的合成 ZIP。
+
+    - 检查 A（P-001）：CT a1, a2 + RTSTRUCT ra
+        ra 深层 ContourImageSequence -> a2
+    - 检查 B（P-001）：CT b1
+        b1 顶层 ReferencedSOPSequence -> ra（跨检查：B -> A）
+    - 检查 C（P-002）：RTSTRUCT rc
+        rc 深层 ContourImageSequence -> b1（跨检查：C -> B，多跳补全 ra/a2）
+
+    以检查 B/C 为起点都应把引用链闭包补全；以检查 A 为起点则只有 A 自身。
+    """
+    def uid(i: int) -> str:
+        return f"1.2.3.4.5.6.7.8.9.{seed}.{i}"
+
+    study_a, series_a, frame_a = uid(1), uid(2), uid(3)
+    a1, a2 = uid(4), uid(5)
+    ra, ra_series = uid(6), uid(7)
+
+    study_b, series_b = uid(20), uid(21)
+    b1 = uid(22)
+
+    study_c, series_c = uid(30), uid(31)
+    rc = uid(32)
+
+    data = {
+        "study_a/CT0001.dcm": _ct_like(a1, series_a, study_a, "P-001", "Zhang^San", frame_a),
+        "study_a/CT0002.dcm": _ct_like(a2, series_a, study_a, "P-001", "Zhang^San", frame_a),
+        "study_a/rt/RS.dcm": _rtstruct_refs(
+            ra, ra_series, study_a, "P-001", "Zhang^San",
+            frame_uid=frame_a, contour_series_uid=series_a,
+            contour_refs=(a2,),
+        ),
+        # b1 顶层 ReferencedSOPSequence -> ra（跨检查 B -> A）
+        "study_b/CT0001.dcm": _ct_with_refs(
+            b1, series_b, study_b, "P-001", "Zhang^San", uid(23),
+            direct_refs=(ra,),
+        ),
+        # rc 深层 ContourImageSequence -> b1（跨检查 C -> B，多跳补全）
+        "study_c/RS.dcm": _rtstruct_refs(
+            rc, series_c, study_c, "P-002", "Li^Si",
+            contour_refs=(b1,),
+        ),
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, blob in data.items():
+            zf.writestr(name, blob)
+    return {
+        "studies": {"A": study_a, "B": study_b, "C": study_c},
+        "series": {"A": series_a, "B": series_b, "C": series_c, "ra": ra_series},
+        "sops": {"a1": a1, "a2": a2, "ra": ra, "b1": b1, "rc": rc},
+    }
+
+
+def build_duplicate_sop_zip(path: str, *, seed: int = 200) -> dict:
+    """两个文件共享同一 SOPInstanceUID（重复实例），被同检查另一个实例引用。"""
+    def uid(i: int) -> str:
+        return f"1.2.3.4.5.6.7.8.9.{seed}.{i}"
+
+    study_uid, series_uid, frame_uid = uid(1), uid(2), uid(3)
+    dup_sop, ref_sop = uid(4), uid(5)
+
+    data = {
+        "dup/CT0001.dcm": _ct_like(dup_sop, series_uid, study_uid, "P-001", "Zhang^San", frame_uid),
+        "dup/CT0002.dcm": _ct_like(dup_sop, series_uid, study_uid, "P-001", "Zhang^San", frame_uid),
+        "dup/RS.dcm": _rtstruct_refs(
+            ref_sop, uid(7), study_uid, "P-001", "Zhang^San",
+            frame_uid=frame_uid, contour_series_uid=series_uid,
+            contour_refs=(dup_sop,),
+        ),
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, blob in data.items():
+            zf.writestr(name, blob)
+    return {
+        "study_uid": study_uid,
+        "sops": {"dup": dup_sop, "ref": ref_sop},
     }
